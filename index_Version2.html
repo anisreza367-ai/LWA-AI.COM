@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LWA AI | Advanced Chat</title>
+    <!-- PWA REQUIRED LINKS -->
+    <link rel="manifest" href="/manifest.json">
+    <meta name="theme-color" content="#4c1d95">
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load jsPDF for PDF generation (Feature 4) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: white;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        /* Custom Styles for modern look */
+        .suggestion-btn {
+            border: 1px solid #e5e7eb;
+            transition: background-color 0.2s, box-shadow 0.2s;
+        }
+        .suggestion-btn:hover {
+            background-color: #f3f4f6;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        }
+        .upgrade-btn {
+            background-color: #f3f8ff;
+            border: 1px solid #c7d2fe;
+            color: #6366f1;
+            font-weight: 600;
+        }
+        .input-shadow {
+            box-shadow: 0 1px 8px rgba(0, 0, 0, 0.1);
+        }
+        /* DeepSeek/Gemini inspired Send Button */
+        #send-button {
+            background-color: #4c1d95; /* Deep Violet */
+            transition: background-color 0.2s;
+            border-radius: 9999px; /* Full pill shape */
+        }
+        #send-button:hover:not(:disabled) {
+            background-color: #6d28d9; /* Lighter Violet on hover */
+        }
+        #send-button:disabled {
+            background-color: #a78bfa; /* Lighter disabled color */
+            cursor: not-allowed;
+        }
+        /* Loading spinner CSS */
+        .spinner {
+            border: 4px solid rgba(255, 255, 255, 0.3);
+            border-top: 4px solid white;
+            border-radius: 50%;
+            width: 16px;
+            height: 16px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .chat-message {
+            white-space: pre-wrap; /* Respect newlines */
+            word-wrap: break-word; /* Wrap long words */
+        }
+    </style>
+</head>
+<body class="p-0">
+
+    <!-- Mobile-first Container (main content area) -->
+    <div id="app-container" class="flex-grow w-full max-w-md mx-auto flex flex-col">
+        <!-- Application UI will be rendered here -->
+    </div>
+
+    <script type="module">
+        // --- Firebase Imports and Setup ---
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, getDoc, collection, addDoc, query, orderBy, onSnapshot, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        setLogLevel('debug');
+
+        // Global Firebase variables
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-lwa-app';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : { /* mock config */ };
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        const LLM_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=`;
+        const PDF_JS_VAR = window.jspdf.jsPDF; // Accessing jspdf
+
+        let app, db, auth;
+        let userId = null;
+        let unsubscribeChat = null; // To manage real-time chat listener
+
+        // Application State
+        const state = {
+            currentPage: 'loading',
+            user: { name: '', class: '', board: '', isPro: false, uid: null },
+            loading: false,
+            message: null,
+            messageType: 'error',
+            chatHistory: [], // Stores { role: 'user'/'ai', text: '...', timestamp: ... }
+            isWebSearchEnabled: true, // Defaulting web search ON
+        };
+
+        // UI References
+        const appContainer = document.getElementById('app-container');
+
+        // --- Utility Functions ---
+
+        function showNotification(msg, type = 'info') {
+            const tempMessage = { text: msg, type };
+            // Simple way to show notification: using a temporary array for re-render
+            state.message = tempMessage;
+            render();
+            setTimeout(() => {
+                state.message = null;
+                render();
+            }, 5000);
+        }
+
+        // Firestore Path Helpers
+        const getProfileDocRef = (uid) => doc(db, 'artifacts', appId, 'users', uid, 'profiles', 'user_profile');
+        const getChatCollectionRef = (uid) => collection(db, 'artifacts', appId, 'users', uid, 'chats');
+
+        // --- AUTHENTICATION & INITIALIZATION ---
+
+        async function initFirebase() {
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                // Check auth state
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        state.user.uid = userId;
+                        await loadUserProfile(userId);
+
+                        if (state.user.name) {
+                            // User is registered
+                            state.currentPage = 'chat';
+                            startChatListener(userId);
+                        } else {
+                            // User is logged in anonymously but not registered
+                            state.currentPage = 'register';
+                        }
+                    } else {
+                        // Not logged in, force anonymous login
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    }
+                    render();
+                });
+
+            } catch (error) {
+                console.error("Firebase Initialization Error:", error);
+                showNotification(`Firebase Init Error: ${error.message}`, 'error');
+                state.currentPage = 'error';
+                render();
+            }
+        }
+
+        async function loadUserProfile(uid) {
+            try {
+                const docSnap = await getDoc(getProfileDocRef(uid));
+                if (docSnap.exists()) {
+                    state.user = { ...state.user, ...docSnap.data() };
+                }
+            } catch (error) {
+                console.error("Error loading user profile:", error);
+                showNotification("Could not load user profile.", 'error');
+            }
+        }
+
+        async function handleRegistration(name, classValue, board) {
+            if (!name || !classValue || !board) {
+                showNotification("Please fill in all registration fields.", 'error');
+                return;
+            }
+
+            state.loading = true;
+            render();
+            try {
+                const profileData = {
+                    name: name.trim(),
+                    class: classValue,
+                    board: board,
+                    isPro: false,
+                    createdAt: serverTimestamp(),
+                };
+                await setDoc(getProfileDocRef(userId), profileData, { merge: true });
+                state.user = { ...state.user, ...profileData };
+                state.currentPage = 'chat';
+                startChatListener(userId); // Start listening after registration
+                showNotification(`Welcome, ${name}! Chat started.`, 'success');
+            } catch (error) {
+                console.error("Registration error:", error);
+                showNotification(`Registration failed: ${error.message}`, 'error');
+            } finally {
+                state.loading = false;
+                render();
+            }
+        }
+
+        async function handleLogout() {
+            if (unsubscribeChat) unsubscribeChat(); // Stop listener
+            await signOut(auth);
+            state.chatHistory = []; // Clear chat
+            window.location.reload(); // Reload to re-trigger anonymous sign-in/registration
+        }
+
+        // --- FIRESTORE CHAT & LLM INTEGRATION ---
+
+        function startChatListener(uid) {
+            if (unsubscribeChat) unsubscribeChat(); // Clear existing listener
+
+            // NOTE: Firestore `orderBy` is avoided due to the Canvas requirement to prevent index errors. We will sort in memory.
+            const chatQuery = query(getChatCollectionRef(uid));
+
+            unsubscribeChat = onSnapshot(chatQuery, (snapshot) => {
+                const history = [];
+                snapshot.forEach(doc => {
+                    const data = doc.data();
+                    history.push({
+                        id: doc.id,
+                        role: data.role,
+                        text: data.text,
+                        timestamp: data.timestamp ? data.timestamp.toDate() : new Date(),
+                        isPinned: data.isPinned || false, // Feature 1
+                    });
+                });
+                
+                // Sort in memory by timestamp (as required)
+                history.sort((a, b) => a.timestamp - b.timestamp);
+                
+                state.chatHistory = history;
+                render();
+                // Auto-scroll to bottom of chat area
+                const chatArea = document.getElementById('chat-messages');
+                if (chatArea) chatArea.scrollTop = chatArea.scrollHeight;
+            }, (error) => {
+                console.error("Chat listener error:", error);
+                showNotification("Failed to load real-time chat.", 'error');
+            });
+        }
+
+        async function handleSendMessage(query) {
+            query = query.trim();
+            if (!query) return;
+
+            // 1. Add user message to state and Firestore
+            const userMessage = { role: 'user', text: query, timestamp: serverTimestamp() };
+            state.chatHistory.push({ ...userMessage, timestamp: new Date() }); // Add instantly to UI
+            document.getElementById('chat-input').value = '';
+            state.loading = true;
+            render();
+            
+            // Add to Firestore (will trigger listener update later)
+            await addDoc(getChatCollectionRef(userId), userMessage);
+
+            // 2. Prepare LLM Call
+            const systemPromptParts = [
+                `You are an expert academic tutor for students following the ${state.user.board} and NCERT syllabus (Classes 6-12).`,
+                `All academic answers must strictly adhere to the prescribed syllabus and contain no external, advanced concepts.`,
+                `DEFAULT RESPONSE LENGTH: Your answers should be approximately 200-250 words (about 20 lines). Adjust length if the user specifies ("short answer", "50 words", etc.).`,
+                `TABULAR FORMAT: For comparative, analytical, or difference-based questions, use a readable Markdown table (rows and columns) for clarity.`,
+                `YOUTUBE SUMMARY: If the query is a YouTube URL, respond only with a concise summary, key points, and concepts.`,
+            ];
+            
+            // Basic chat history conversion for context
+            const contents = state.chatHistory.map(msg => ({
+                role: msg.role === 'user' ? 'user' : 'model',
+                parts: [{ text: msg.text }]
+            }));
+            
+            // Check for YouTube link
+            const isYouTubeLink = query.match(/^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+$/);
+            
+            const payload = {
+                contents: contents,
+                systemInstruction: { parts: [{ text: systemPromptParts.join(' ')}] },
+                // Feature 8: Google Search grounding
+                tools: state.isWebSearchEnabled ? [{ "google_search": {} }] : [],
+            };
+
+            // 3. Make API Call with exponential backoff
+            const apiKey = "";
+            let responseText = "AI Response Placeholder.";
+            const maxRetries = 3;
+
+            for (let i = 0; i < maxRetries; i++) {
+                try {
+                    const response = await fetch(LLM_API_URL + apiKey, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+
+                    const result = await response.json();
+                    responseText = result.candidates?.[0]?.content?.parts?.[0]?.text || "Sorry, I couldn't generate a response.";
+                    break; // Success, exit loop
+                } catch (error) {
+                    console.error(`Attempt ${i + 1} failed:`, error);
+                    if (i === maxRetries - 1) {
+                        responseText = "Error: Failed to connect to AI after multiple retries.";
+                    } else {
+                        await new Promise(resolve => setTimeout(resolve, Math.pow(2, i) * 1000)); // Exponential backoff
+                    }
+                }
+            }
+            
+            // 4. Add AI response to Firestore
+            const aiMessage = { role: 'ai', text: responseText, timestamp: serverTimestamp() };
+            await addDoc(getChatCollectionRef(userId), aiMessage);
+
+            state.loading = false;
+            render();
+        }
+
+        async function handlePinMessage(chatId, currentPinStatus) {
+            try {
+                const docRef = doc(db, 'artifacts', appId, 'users', userId, 'chats', chatId);
+                await setDoc(docRef, { isPinned: !currentPinStatus }, { merge: true });
+                showNotification(`Message ${!currentPinStatus ? 'pinned' : 'unpinned'}!`, 'info');
+            } catch (error) {
+                console.error("Pin update error:", error);
+                showNotification("Could not update pin status.", 'error');
+            }
+        }
+
+        // --- PDF & Diagram Functions ---
+
+        function generatePDF(chat) {
+            if (typeof PDF_JS_VAR === 'undefined') {
+                showNotification("PDF Library not loaded. Try reloading.", 'error');
+                return;
+            }
+            const doc = new PDF_JS_VAR();
+            const margin = 10;
+            const maxWidth = 190;
+            let y = margin;
+            
+            doc.setFontSize(16);
+            doc.text(`LWA AI Response for ${state.user.name}`, margin, y);
+            y += 10;
+            
+            doc.setFontSize(10);
+            const lines = doc.splitTextToSize(chat.text, maxWidth);
+            doc.text(lines, margin, y);
+            
+            doc.save("LWA_AI_Note.pdf");
+            showNotification("PDF download started.", 'success');
+        }
+
+        function simulateDiagram(concept) {
+             // Feature 3: Diagram generation is complex (requires image generation model).
+             // For this single-file app, we'll simulate it by generating a simple SVG block placeholder.
+             const svg = `<svg width="100%" height="150" viewBox="0 0 300 150" xmlns="http://www.w3.org/2000/svg" class="mt-3 border border-indigo-400 rounded-lg bg-indigo-50">
+                            <rect x="5" y="5" width="290" height="140" fill="#e0e7ff" rx="10"/>
+                            <text x="150" y="75" font-family="Inter, sans-serif" font-size="16" fill="#312e81" text-anchor="middle">Diagram Placeholder for: ${concept}</text>
+                            <circle cx="150" cy="75" r="5" fill="#4f46e5"/>
+                            <line x1="50" y1="50" x2="250" y2="100" stroke="#4f46e5" stroke-width="2"/>
+                        </svg>`;
+             return svg;
+        }
+
+        // --- UI COMPONENTS (Renderers) ---
+
+        function renderMessage() {
+            if (!state.message) return '';
+            const msg = state.message;
+            const bgColor = msg.type === 'success' ? 'bg-green-100 border-green-400 text-green-700' :
+                            msg.type === 'error' ? 'bg-red-100 border-red-400 text-red-700' :
+                            'bg-blue-100 border-blue-400 text-blue-700';
+            return `
+                <div class="fixed top-4 left-1/2 -translate-x-1/2 p-3 rounded-lg border ${bgColor} text-sm transition-all duration-300 z-50 shadow-lg max-w-xs md:max-w-md">
+                    ${msg.text}
+                </div>
+            `;
+        }
+
+        function renderRegistrationView() {
+            return `
+                <div class="p-6 md:p-8 flex flex-col items-center justify-center min-h-screen bg-gray-50">
+                    <div class="w-full max-w-sm p-6 bg-white rounded-xl shadow-2xl border border-violet-100">
+                        <h1 class="text-3xl font-extrabold text-center text-gray-800 mb-2">LWA AI</h1>
+                        <p class="text-center text-gray-600 mb-6">Register to get Syllabus-Aligned answers.</p>
+                        
+                        <form id="registration-form" class="space-y-4">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700" for="reg-name">Your Full Name</label>
+                                <input type="text" id="reg-name" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-violet-500 focus:border-violet-500" placeholder="e.g., Alok Kumar">
+                            </div>
+                            
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700" for="reg-class">Class (6-12)</label>
+                                <select id="reg-class" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-violet-500 focus:border-violet-500">
+                                    <option value="">-- Select Class --</option>
+                                    <option value="6">Class 6</option>
+                                    <option value="7">Class 7</option>
+                                    <option value="8">Class 8</option>
+                                    <option value="9">Class 9</option>
+                                    <option value="10">Class 10</option>
+                                    <option value="11">Class 11</option>
+                                    <option value="12">Class 12</option>
+                                </select>
+                            </div>
+
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700" for="reg-board">Education Board</label>
+                                <select id="reg-board" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-violet-500 focus:border-violet-500">
+                                    <option value="">-- Select Board --</option>
+                                    <option value="Bihar Board">Bihar Board</option>
+                                    <option value="NCERT">NCERT / CBSE</option>
+                                </select>
+                            </div>
+                            
+                            <b
